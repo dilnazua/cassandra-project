@@ -1,4 +1,6 @@
-"""A small, deterministic network simulator with fault injection.
+"""
+Code by Carl Scheffler 2025 DSLabs
+A small, deterministic network simulator with fault injection.
 
 Key ideas:
 
