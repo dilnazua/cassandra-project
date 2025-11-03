@@ -1,4 +1,7 @@
-"""Deterministic clock and scheduler utilities for simulations.
+"""
+Code by Carl Scheffler 2025 DSLabs
+
+Deterministic clock and scheduler utilities for simulations.
 
 Use these helpers to control time explicitly during tests and demos.
 
