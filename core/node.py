@@ -10,7 +10,7 @@ class Node:
 
     def __init__(self, node_id=None, network=None, scheduler=None, ring=None, 
                  replication_factor: int = 2, snapshot_interval_ms: int = 500, 
-                 log_dir: str = "logs", use_uuid: bool = True):
+                 log_dir: str = "logs", use_uuid: bool = True, grace_period_seconds: int = 864000):
         # Auto-generate UUID if no node_id provided
         if node_id is None:
             self.node_id = str(uuid.uuid4())
@@ -26,6 +26,7 @@ class Node:
         self.alive = True
         self.replication_factor = replication_factor
         self.snapshot_interval_ms = snapshot_interval_ms
+        self.grace_period_seconds = grace_period_seconds
         
         # Setup disk storage paths
         self.log_dir = Path(log_dir) / self.node_id
@@ -108,14 +109,34 @@ class Node:
         """Client API: delete key from the system."""
         target = self.ring.get_node(key)
         if target == self:
-            self._local_delete(key)
+            timestamp = time.time()
+            self._local_delete(key, timestamp=timestamp)
             # Replicate the delete to replicas
-            self._replicate_delete(key)
+            self._replicate_delete(key, timestamp=timestamp)
         else:
-            self.network.send(target.node_id, {
-                "type": "DELETE",
-                "key": key,
-                "from": self.node_id
+            if not target.alive:
+                replicas = self.ring.get_replicas(key, self.replication_factor)
+                # Try to find first alive replica to act as coordinator
+                coordinator = None
+                for replica in replicas:
+                    if replica.alive and replica.node_id != target.node_id:
+                        coordinator = replica
+                        break
+                if coordinator:
+                    logging.info(f"[Node {self.node_id}] DELETE {key} -> primary {target.node_id} is down, forwarding to replica coordinator {coordinator.node_id}")
+                    self.network.send(coordinator.node_id, {
+                        "type": "DELETE",
+                        "key": key,
+                        "from": self.node_id
+                    })
+                else:
+                    logging.error(f"[Node {self.node_id}] DELETE {key} -> FAILED: primary {target.node_id} is down and no alive replicas")
+            else:
+                logging.info(f"[Node {self.node_id}] DELETE {key} -> forwarding to primary Node {target.node_id}")
+                self.network.send(target.node_id, {
+                    "type": "DELETE",
+                    "key": key,
+                    "from": self.node_id
             })
 
 
@@ -159,7 +180,11 @@ class Node:
     def _write_snapshot(self):
         """Write current in-memory state to disk snapshot.
             In Cassandra, the snapshot is discarded after it is written, but for a demo, we keep it.
+            Compacts expired tombstones before writing snapshot.
         """
+        # Compact expired tombstones before snapshot (like Cassandra compaction)
+        self._compact_tombstones()
+        
         try:
             # Write to temporary file first, then rename
             temp_path = self.snapshot_path.with_suffix('.tmp')
@@ -212,7 +237,9 @@ class Node:
                 logging.warning(f"[Node {self.node_id}] Failed to replay commit log: {e}")
 
     def _local_get(self, key):
-        """Get value for key, returning just the value string (extracted from dict format)."""
+        """Get value for key, returning just the value string (extracted from dict format).
+        Also performs expiration of expired tombstones during reads.
+        """
         entry = self.data.get(key, None)
         if entry is None:
             logging.info(f"[Node {self.node_id}] Lookup key={key} -> None")
@@ -220,6 +247,12 @@ class Node:
         # Extract value from the format: {"value": ..., "timestamp": ...} or {"deleted": True, ...}
         if isinstance(entry, dict):
             if entry.get("deleted"):
+                # Check if tombstone is expired (lazy expiration)
+                if self._is_tombstone_expired(entry.get("timestamp", 0)):
+                    # Remove expired tombstone
+                    del self.data[key]
+                    logging.info(f"[Node {self.node_id}] Removed expired tombstone for key={key} during read")
+                    return None
                 logging.info(f"[Node {self.node_id}] Lookup key={key} -> None (deleted)")
                 return None
             val = entry.get("value")
@@ -248,16 +281,30 @@ class Node:
         """Mark key as deleted and write to commit log."""
         if timestamp is None:
             timestamp = time.time()
+        current = self.data.get(key)
+        current_ts = current.get("timestamp", 0) if isinstance(current, dict) else 0
+        
+        # Clean up expired tombstone if present
+        if isinstance(current, dict) and current.get("deleted") and self._is_tombstone_expired(current_ts):
+            del self.data[key]
+            current_ts = 0  # Reset after removing expired tombstone
+            logging.info(f"[Node {self.node_id}] Removed expired tombstone for key={key} before new delete")
+        
         # Tombstone: store deletion marker instead of removing immediately
-        self.data[key] = {"deleted": True, "timestamp": timestamp}
-        self._append_commit_log(key, {"deleted": True}, mutation_type="DELETE", timestamp=timestamp)
-        logging.info(f"[Node {self.node_id}] Deleted key={key}, ts={timestamp}")
+        if timestamp > current_ts:
+            self.data[key] = {"deleted": True, "timestamp": timestamp}
+            self._append_commit_log(key, None, mutation_type="DELETE", timestamp=timestamp)
+            logging.info(f"[Node {self.node_id}] Deleted key={key}, ts={timestamp}")
+        elif timestamp == current_ts:
+            # Idempotent duplicate - don't update or log
+            logging.info(f"[Node {self.node_id}] Duplicate for key={key}, ts={timestamp} - skipping")
 
     def _replicate_delete(self, key, timestamp=None):
         replicas = self.ring.get_replicas(key, self.replication_factor)
         for replica in replicas:
             if replica.node_id == self.node_id:
                 continue
+            logging.info(f"[Node {self.node_id}] Sending REPLICATE_DELETE for key={key} to {replica.node_id}")
             self.network.send(replica.node_id, {
                 "type": "REPLICATE_DELETE",
                 "key": key,
@@ -359,9 +406,28 @@ class Node:
             else:
                 logging.info(f"[Node {self.node_id}] Applied snapshot: {len(incoming)} keys from {msg['from']}, merged={merged_count}, overwritten={overwritten_count}")
         elif mtype == "DELETE":
-            self._local_delete(msg["key"])
-            self._replicate_delete(msg["key"])
+            timestamp = time.time()
+            self._local_delete(msg["key"], timestamp=timestamp)
+            self._replicate_delete(msg["key"], timestamp=timestamp)
 
         elif mtype == "REPLICATE_DELETE":
             self._local_delete(msg["key"], timestamp=msg["timestamp"])
 
+
+    def _is_tombstone_expired(self, tombstone_timestamp: float) -> bool:
+        """Check if tombstone is older than gc_grace_seconds."""
+        return (time.time() - tombstone_timestamp) > self.grace_period_seconds
+    
+    def _compact_tombstones(self):
+        """Remove expired tombstones from in-memory store."""
+        current_time = time.time()
+        expired_keys = []
+        for key, entry in self.data.items():
+            if isinstance(entry, dict) and entry.get("deleted"):
+                tombstone_ts = entry.get("timestamp", 0)
+                if (current_time - tombstone_ts) > self.grace_period_seconds:
+                    expired_keys.append(key)
+        
+        for key in expired_keys:
+            del self.data[key]
+            logging.info(f"[Node {self.node_id}] Removed expired tombstone for key={key}")
