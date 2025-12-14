@@ -33,16 +33,22 @@ A distributed key-value store implementation inspired by Apache Cassandra, featu
 cassandra-project/
 ├── core/
 │   ├── node.py          # Node implementation with storage, replication, recovery
-│   └── ring.py          # Consistent hashing ring for key distribution
+│   ├── ring.py          # Consistent hashing ring for key distribution
+│   ├── gossip.py        # Gossip protocol for cluster membership
+│   └── storage.py       # Storage manager with commit logs and snapshots
 ├── sim/
 │   ├── network.py       # Network simulator with fault injection
 │   └── scheduler.py     # Deterministic event scheduler
+├── dashboard/
+│   ├── app.py           # Streamlit visualization dashboard
+│   └── README.md        # Dashboard documentation
 ├── logs/                # Per-node commit logs and snapshots
 │   └── {node_id}/
 │       ├── commit.log   # Append-only mutation log (PUT/DELETE)
 │       └── snapshot.json # Periodic full state snapshot with timestamps
 ├── main.py              # Demo simulation
 ├── requirements.txt     # Python dependencies
+├── run_dashboard.sh     # Convenience script to run dashboard
 └── README.md
 ```
 
@@ -55,8 +61,36 @@ cassandra-project/
 git clone <repository-url>
 cd cassandra-project
 
+# Install dependencies
+pip install -r requirements.txt
+
 # Run the demo simulation
 python3 main.py
+```
+
+### Visualization Dashboard
+
+The project includes an interactive Streamlit dashboard to visualize the system in real-time:
+
+```bash
+# Run the visualization dashboard
+streamlit run dashboard/app.py
+
+# Or use the convenience script
+./run_dashboard.sh
+```
+
+See `dashboard/README.md` for more details.
+
+
+### Testing
+```bash
+python -m testing.test_gossip
+python -m testing.test_replication
+python -m testing.test_crash_recovery
+python -m testing.test_partition_tolerance
+
+python main.py # to see the process
 ```
 
 ## Architecture

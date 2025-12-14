@@ -1,16 +1,18 @@
 import logging
-import json
-import os
 import uuid
-from pathlib import Path
 import time
+from typing import Dict, Optional
+
+from .gossip import GossipProtocol
+from .storage import StorageManager
 
 class Node:
     """Represents a database node in the distributed ring."""
 
     def __init__(self, node_id=None, network=None, scheduler=None, ring=None, 
                  replication_factor: int = 2, snapshot_interval_ms: int = 500, 
-                 log_dir: str = "logs", use_uuid: bool = True, grace_period_seconds: int = 864000):
+                 log_dir: str = "logs", use_uuid: bool = True, grace_period_seconds: int = 864000,
+                 gossip_interval_ms: int = 1000, failure_timeout_ms: int = 10000):
         # Auto-generate UUID if no node_id provided
         if node_id is None:
             self.node_id = str(uuid.uuid4())
@@ -25,30 +27,36 @@ class Node:
         self.data = {}  # key-value store (in-memory)
         self.alive = True
         self.replication_factor = replication_factor
-        self.snapshot_interval_ms = snapshot_interval_ms
-        self.grace_period_seconds = grace_period_seconds
         
-        # Setup disk storage paths
-        self.log_dir = Path(log_dir) / self.node_id
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.commit_log_path = self.log_dir / "commit.log"
-        self.snapshot_path = self.log_dir / "snapshot.json"
+        self.storage = StorageManager(
+            self.node_id, 
+            log_dir=log_dir,
+            snapshot_interval_ms=snapshot_interval_ms,
+            grace_period_seconds=grace_period_seconds
+        )
         
-        if not self.commit_log_path.exists():
-            self.commit_log_path.touch()
+        self.gossip = GossipProtocol(
+            self.node_id,
+            network=network,
+            scheduler=scheduler,
+            ring=ring,
+            gossip_interval_ms=gossip_interval_ms,
+            failure_timeout_ms=failure_timeout_ms
+        )
         
-        # Recover from disk on startup
-        self._recover_from_disk()
+        self.data = self.storage.recover_from_disk()
         
-        # Schedule periodic snapshots
         self._schedule_snapshot()
+        
+        if self.alive and scheduler:
+            self.gossip.start()
 
         if network:
             network.register(self.node_id, self.on_receive)
 
     def put(self, key, value):
         """
-        Client API: store key in the correct node.
+        Store key in the correct node.
         
         Note: In consistent hashing, keys are routed to their primary node based on hash.
         Only the primary node and its replicas store the data. If the calling node is not
@@ -57,7 +65,6 @@ class Node:
         target = self.ring.get_node(key)
         if target == self:
             logging.info(f"[Node {self.node_id}] PUT {key}={value} -> storing locally (I am primary)")
-            # Store first to get the timestamp
             timestamp = time.time()
             self._local_put(key, value, timestamp=timestamp)
             # Trigger replication from primary node with timestamp
@@ -93,7 +100,7 @@ class Node:
                 })
 
     def get(self, key):
-        """Client API: retrieve key from correct node."""
+        """Retrieve key from correct node."""
         target = self.ring.get_node(key)
         if target == self:
             return self._local_get(key)
@@ -106,12 +113,11 @@ class Node:
     
 
     def delete(self, key):
-        """Client API: delete key from the system."""
+        """Delete key from the system."""
         target = self.ring.get_node(key)
         if target == self:
             timestamp = time.time()
             self._local_delete(key, timestamp=timestamp)
-            # Replicate the delete to replicas
             self._replicate_delete(key, timestamp=timestamp)
         else:
             if not target.alive:
@@ -137,7 +143,7 @@ class Node:
                     "type": "DELETE",
                     "key": key,
                     "from": self.node_id
-            })
+                })
 
 
     # Internal methods
@@ -152,89 +158,23 @@ class Node:
         if timestamp > current_ts:
             self.data[key] = {"value": value, "timestamp": timestamp}
             # Store just the value string in commit log, not the full dict
-            self._append_commit_log(key, value, mutation_type="PUT", timestamp=timestamp)
+            self.storage.append_commit_log(key, value, mutation_type="PUT", timestamp=timestamp)
             logging.info(f"[Node {self.node_id}] Stored key={key}, value={value}, ts={timestamp}")
         elif timestamp == current_ts:
             # Idempotent duplicate - don't update or log
             logging.info(f"[Node {self.node_id}] Duplicate for key={key}, value={value}, ts={timestamp} - skipping")
 
     
-    def _append_commit_log(self, key, value, mutation_type="PUT", timestamp=None):
-        if timestamp is None:
-            timestamp = time.time()
-        entry = {
-            "key": key,
-            "value": value,
-            "timestamp": timestamp,
-            "type": mutation_type
-        }
-        try:
-            with open(self.commit_log_path, 'a') as f:
-                f.write(json.dumps(entry) + "\n")
-                f.flush()
-        except Exception as e:
-            logging.error(f"[Node {self.node_id}] Failed to write commit log: {e}")
-
-
-    
-    def _write_snapshot(self):
-        """Write current in-memory state to disk snapshot.
-            In Cassandra, the snapshot is discarded after it is written, but for a demo, we keep it.
-            Compacts expired tombstones before writing snapshot.
-        """
-        # Compact expired tombstones before snapshot (like Cassandra compaction)
-        self._compact_tombstones()
-        
-        try:
-            # Write to temporary file first, then rename
-            temp_path = self.snapshot_path.with_suffix('.tmp')
-            with open(temp_path, 'w') as f:
-                json.dump(self.data, f, indent=2)
-            temp_path.replace(self.snapshot_path)
-            logging.info(f"[Node {self.node_id}] Snapshot written: {len(self.data)} keys")
-        except Exception as e:
-            logging.error(f"[Node {self.node_id}] Failed to write snapshot: {e}")
-    
     def _schedule_snapshot(self):
         """Schedule periodic snapshot writes."""
         if self.alive and self.scheduler:
-            self.scheduler.call_later(self.snapshot_interval_ms, self._take_snapshot)
+            self.scheduler.call_later(self.storage.snapshot_interval_ms, self._take_snapshot)
     
     def _take_snapshot(self):
         """Take a snapshot and schedule the next one."""
         if self.alive:
-            self._write_snapshot()
+            self.storage.write_snapshot(self.data)
             self._schedule_snapshot()
-    
-    def _recover_from_disk(self):
-        """Recover node state from disk: load snapshot then replay commit log."""
-        # Load snapshot if it exists 
-        if self.snapshot_path.exists():
-            try:
-                with open(self.snapshot_path, 'r') as f:
-                    self.data = json.load(f)
-                logging.info(f"[Node {self.node_id}] Loaded snapshot: {len(self.data)} keys")
-            except Exception as e:
-                logging.warning(f"[Node {self.node_id}] Failed to load snapshot: {e}")
-                self.data = {}
-        
-        # Replay commit log entries after snapshot
-        if self.commit_log_path.exists():
-            try:
-                with open(self.commit_log_path, 'r') as f:
-                    for line in f:
-                        if line.strip():
-                            entry = json.loads(line)
-                            timestamp = entry.get("timestamp", time.time())
-                            if entry.get("type") == "DELETE":
-                                self.data[entry["key"]] = {"deleted": True, "timestamp": timestamp}
-                            else:
-                                # Reconstruct dict format from commit log: value is the actual value string
-                                value = entry["value"]
-                                self.data[entry["key"]] = {"value": value, "timestamp": timestamp}
-                logging.info(f"[Node {self.node_id}] Replayed commit log")
-            except Exception as e:
-                logging.warning(f"[Node {self.node_id}] Failed to replay commit log: {e}")
 
     def _local_get(self, key):
         """Get value for key, returning just the value string (extracted from dict format).
@@ -247,9 +187,7 @@ class Node:
         # Extract value from the format: {"value": ..., "timestamp": ...} or {"deleted": True, ...}
         if isinstance(entry, dict):
             if entry.get("deleted"):
-                # Check if tombstone is expired (lazy expiration)
-                if self._is_tombstone_expired(entry.get("timestamp", 0)):
-                    # Remove expired tombstone
+                if self.storage.is_tombstone_expired(entry.get("timestamp", 0)):
                     del self.data[key]
                     logging.info(f"[Node {self.node_id}] Removed expired tombstone for key={key} during read")
                     return None
@@ -268,6 +206,10 @@ class Node:
         for replica in replicas:
             if replica.node_id == self.node_id:
                 continue
+            # Only replicate to alive nodes
+            if not replica.alive:
+                logging.warning(f"[Node {self.node_id}] Skipping replication to dead replica {replica.node_id}")
+                continue
             logging.info(f"[Node {self.node_id}] Sending REPLICATE for key={key} to {replica.node_id}")
             self.network.send(replica.node_id, {
                 "type": "REPLICATE",
@@ -285,7 +227,7 @@ class Node:
         current_ts = current.get("timestamp", 0) if isinstance(current, dict) else 0
         
         # Clean up expired tombstone if present
-        if isinstance(current, dict) and current.get("deleted") and self._is_tombstone_expired(current_ts):
+        if isinstance(current, dict) and current.get("deleted") and self.storage.is_tombstone_expired(current_ts):
             del self.data[key]
             current_ts = 0  # Reset after removing expired tombstone
             logging.info(f"[Node {self.node_id}] Removed expired tombstone for key={key} before new delete")
@@ -293,7 +235,7 @@ class Node:
         # Tombstone: store deletion marker instead of removing immediately
         if timestamp > current_ts:
             self.data[key] = {"deleted": True, "timestamp": timestamp}
-            self._append_commit_log(key, None, mutation_type="DELETE", timestamp=timestamp)
+            self.storage.append_commit_log(key, None, mutation_type="DELETE", timestamp=timestamp)
             logging.info(f"[Node {self.node_id}] Deleted key={key}, ts={timestamp}")
         elif timestamp == current_ts:
             # Idempotent duplicate - don't update or log
@@ -303,6 +245,10 @@ class Node:
         replicas = self.ring.get_replicas(key, self.replication_factor)
         for replica in replicas:
             if replica.node_id == self.node_id:
+                continue
+            # Only replicate to alive nodes
+            if not replica.alive:
+                logging.warning(f"[Node {self.node_id}] Skipping replication delete to dead replica {replica.node_id}")
                 continue
             logging.info(f"[Node {self.node_id}] Sending REPLICATE_DELETE for key={key} to {replica.node_id}")
             self.network.send(replica.node_id, {
@@ -317,6 +263,7 @@ class Node:
         if self.alive:
             logging.info(f"[Node {self.node_id}] FAIL")
         self.alive = False
+        self.gossip.mark_node_down(self.node_id)
 
     def recover(self):
         """Node recovery: load from disk, then request state from successor."""
@@ -324,19 +271,25 @@ class Node:
         self.alive = True
         if was_dead:
             logging.info(f"[Node {self.node_id}] RECOVER -> loading from disk")
-            # First, recover what we have on disk
-            self._recover_from_disk()
-            # Then request missing state from network
+            self.data = self.storage.recover_from_disk()
+            # Update gossip state to reflect we're back up
+            self.gossip.mark_node_up(self.node_id)
+            # Request missing state from network
             logging.info(f"[Node {self.node_id}] RECOVER -> requesting snapshot from peers")
             successors = self.ring.get_successors(self.node_id, 1)
-            if successors:
-                succ = successors[0]
-                self.network.send(succ.node_id, {
-                    "type": "SNAPSHOT_REQUEST",
-                    "from": self.node_id,
-                })
-            # Resume periodic snapshots
+            # Try to find an alive successor for snapshot request
+            for succ in successors:
+                if succ.alive:
+                    self.network.send(succ.node_id, {
+                        "type": "SNAPSHOT_REQUEST",
+                        "from": self.node_id,
+                    })
+                    break
+            else:
+                logging.warning(f"[Node {self.node_id}] No alive successors available for snapshot recovery")
             self._schedule_snapshot()
+            if self.scheduler:
+                self.gossip.start()
 
     def on_receive(self, msg):
         """Handle incoming messages."""
@@ -346,7 +299,6 @@ class Node:
         if mtype == "PUT":
             timestamp = time.time()
             self._local_put(msg["key"], msg["value"], timestamp=timestamp)
-            # Replicate to successors
             self._replicate(msg["key"], msg["value"], timestamp=timestamp)
         elif mtype == "GET":
             val = self._local_get(msg["key"])
@@ -385,7 +337,6 @@ class Node:
                     current = self.data.get(key)
                     incoming_val = value
                     
-                    # Get timestamps safely
                     current_ts = current.get("timestamp", 0) if isinstance(current, dict) else 0
                     incoming_ts = incoming_val.get("timestamp", 0) if isinstance(incoming_val, dict) else 0
                     
@@ -395,7 +346,7 @@ class Node:
                         overwritten_count += 1
                         merged_count += 1
                     elif incoming_ts == current_ts:
-                        # Same timestamp - idempotent duplicate, skip silently
+                        # Idempotent duplicate
                         skipped_count += 1
                     else:
                         # Older timestamp - skip
@@ -406,28 +357,12 @@ class Node:
             else:
                 logging.info(f"[Node {self.node_id}] Applied snapshot: {len(incoming)} keys from {msg['from']}, merged={merged_count}, overwritten={overwritten_count}")
         elif mtype == "DELETE":
+            # Primary node generates authoritative timestamp for client requests
             timestamp = time.time()
             self._local_delete(msg["key"], timestamp=timestamp)
             self._replicate_delete(msg["key"], timestamp=timestamp)
 
         elif mtype == "REPLICATE_DELETE":
             self._local_delete(msg["key"], timestamp=msg["timestamp"])
-
-
-    def _is_tombstone_expired(self, tombstone_timestamp: float) -> bool:
-        """Check if tombstone is older than gc_grace_seconds."""
-        return (time.time() - tombstone_timestamp) > self.grace_period_seconds
-    
-    def _compact_tombstones(self):
-        """Remove expired tombstones from in-memory store."""
-        current_time = time.time()
-        expired_keys = []
-        for key, entry in self.data.items():
-            if isinstance(entry, dict) and entry.get("deleted"):
-                tombstone_ts = entry.get("timestamp", 0)
-                if (current_time - tombstone_ts) > self.grace_period_seconds:
-                    expired_keys.append(key)
-        
-        for key in expired_keys:
-            del self.data[key]
-            logging.info(f"[Node {self.node_id}] Removed expired tombstone for key={key}")
+        elif mtype == "GOSSIP":
+            self.gossip.handle_gossip_message(msg)
