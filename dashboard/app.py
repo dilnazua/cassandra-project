@@ -79,7 +79,7 @@ def draw_ring(ring, nodes, selected_key=None):
     node_positions = {}
     for hash_val, node_id in ring.ring:
         # Convert hash to angle (0 to 2π)
-        angle = (hash_val / (2**32)) * 2 * pi
+        angle = 2 * pi - (hash_val / (2**32)) * 2 * pi
         x = center[0] + radius * cos(angle)
         y = center[1] + radius * sin(angle)
         node_positions[node_id] = (x, y, angle, hash_val)
@@ -106,7 +106,7 @@ def draw_ring(ring, nodes, selected_key=None):
         if primary_id:
             # Hash the key
             key_hash = ring._hash(key)
-            angle = (key_hash / (2**32)) * 2 * pi
+            angle = 2 * pi - (key_hash / (2**32)) * 2 * pi
             x = center[0] + (radius - 0.3) * cos(angle)
             y = center[1] + (radius - 0.3) * sin(angle)
             

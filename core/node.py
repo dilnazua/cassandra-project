@@ -242,7 +242,14 @@ class Node:
             logging.info(f"[Node {self.node_id}] Duplicate for key={key}, ts={timestamp} - skipping")
 
     def _replicate_delete(self, key, timestamp=None):
+        """
+        Replicate delete to current replica set, plus any nodes that have the key.
+    
+        """
         replicas = self.ring.get_replicas(key, self.replication_factor)
+        replica_ids = {r.node_id for r in replicas}
+        
+        # Send delete to all current replicas
         for replica in replicas:
             if replica.node_id == self.node_id:
                 continue
@@ -250,13 +257,31 @@ class Node:
             if not replica.alive:
                 logging.warning(f"[Node {self.node_id}] Skipping replication delete to dead replica {replica.node_id}")
                 continue
-            logging.info(f"[Node {self.node_id}] Sending REPLICATE_DELETE for key={key} to {replica.node_id}")
+            logging.info(f"[Node {self.node_id}] Sending REPLICATE_DELETE for key={key} to replica {replica.node_id}")
             self.network.send(replica.node_id, {
                 "type": "REPLICATE_DELETE",
                 "key": key,
                 "timestamp": timestamp,
                 "from": self.node_id,
             })
+        
+        # Also send to nodes that have the key but aren't in current replica set
+        for node_id, node in self.ring.nodes.items():
+            if node_id == self.node_id:
+                continue
+            if node_id in replica_ids:
+                continue
+            if not node.alive:
+                continue
+            # Check if this node has the key
+            if key in node.data:
+                logging.info(f"[Node {self.node_id}] Sending REPLICATE_DELETE for key={key} to {node_id} (has orphaned copy)")
+                self.network.send(node_id, {
+                    "type": "REPLICATE_DELETE",
+                    "key": key,
+                    "timestamp": timestamp,
+                    "from": self.node_id,
+                })
 
     def fail(self):
         """Simulate node failure (drops/ignores all incoming)."""
@@ -329,7 +354,7 @@ class Node:
             skipped_count = 0
             for key, value in incoming.items():
                 if key not in self.data:
-                    # New key, just add it
+                    # New key, just add it 
                     self.data[key] = value
                     merged_count += 1
                 else:
