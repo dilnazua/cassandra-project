@@ -37,7 +37,6 @@ def main():
         scheduler.run_due()
         clock.advance(150)
 
-    # Introduce a failure and a write during outage
     n2.fail()
     n1.put("cherry", "dark-red")
 

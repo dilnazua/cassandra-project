@@ -1,1 +1,4 @@
 logging==0.4.9.6
+streamlit>=1.52.1
+matplotlib>=3.7.0
+numpy>=1.24.0
